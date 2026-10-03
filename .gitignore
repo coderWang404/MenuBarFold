@@ -1,0 +1,14 @@
+# Build output
+build/
+.build/
+.swiftpm/
+
+# Local debugging spikes
+spike/
+
+# macOS
+.DS_Store
+
+# Tooling artifacts
+.playwright-mcp/
+today_*.json
