@@ -32,8 +32,10 @@ macOS 27 中 `MenuBarAgent` 进程接管了所有菜单栏项的合成与折叠�
 - **使用**：`AXPress` 对任何状态的项都有效（系统级能力，实测折叠/移除项也能弹菜单）。
 - **折叠/展开**：直接 `AXUIElementSetAttributeValue(AXPosition)` 写位置
   （macOS 27 的怪癖：返回错误码但位置真实生效）；折叠有坐标 ⌘-drag 兜底。
-- **入口**：macOS 27 下新建 status item 一律被系统收纳，所以面板主要用
-  **⌃⌥M** 呼出；菜单栏里的 chevron（若出现在系统 ⌄ 托盘）点击也可。
+- **入口**：macOS 27 把新建的 status item 默认收进系统 ⌄ 托盘（程序无法强制显示——
+  AX 写位置、isVisible、autosaveName、预写偏好都试过）。所以面板主要用
+  **⌃⌥M** 呼出；要找回菜单栏图标：点菜单栏的 ⌄ 打开系统托盘，把 MenuBarFold
+  的图标拖到菜单栏上即可（之后点击它也能弹面板）。
 
 ## 已知限制
 
