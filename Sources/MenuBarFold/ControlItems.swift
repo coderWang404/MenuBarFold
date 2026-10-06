@@ -1,71 +1,73 @@
 import Cocoa
 
-/// Our own status items: the chevron that toggles the panel, and the divider
-/// that marks the fold boundary. Expanding the divider to a huge width pushes
-/// everything ordered left of it off the screen (the Hidden Bar / Ice trick).
+/// The app's own menu bar status item (the chevron toggle).
+///
+/// On macOS 27 the system itself owns item collapse; the app no longer
+/// maintains a divider status item. The chevron is recreated if the system
+/// parks it at an unreachable sentinel position.
 @MainActor
 final class ControlItems {
-    /// Chevron shown in the menu bar; clicking it toggles the panel.
-    private(set) var chevronItem: NSStatusItem!
+    private(set) var chevronItem: NSStatusItem?
+    var chevronAXPosition: CGPoint?
+    private var loggedParked = false
 
-    /// Boundary item. Items ordered left of it are the folded set.
-    private(set) var dividerItem: NSStatusItem!
-
-    /// Window-server window IDs of our own items, resolved by window title
-    /// (items are hosted by ControlCenter, so `button.window` is nil).
-    var dividerWindowID: CGWindowID?
-    var chevronWindowID: CGWindowID?
-
-    /// Window-server IDs that belong to us — excluded from managed lists.
-    var ownWindowIDs: Set<CGWindowID> {
-        var set = Set<CGWindowID>()
-        if let dividerWindowID { set.insert(dividerWindowID) }
-        if let chevronWindowID { set.insert(chevronWindowID) }
-        return set
+    var onChevronClick: (() -> Void)? {
+        didSet { bindAction() }
     }
 
-    /// Window-title prefix of our status items (autosaveName becomes the title).
-    static let ownTitlePrefix = "MenuBarFold."
-
-    /// Width used when the divider is expanded — enough to push everything
-    /// left of it off screen but not absurdly far.
-    private var expandedLength: CGFloat {
-        let w = NSScreen.screens.map(\.frame.width).max() ?? 1512
-        return w
+    func setup() {
+        if chevronItem == nil { makeChevron() }
     }
 
-    func setup(onChevronClick: @escaping () -> Void) {
-        dividerItem = NSStatusBar.system.statusItem(withLength: 6)
-        dividerItem.autosaveName = "MenuBarFold.divider"
-        dividerItem.button?.image = nil
-        dividerItem.button?.isEnabled = false
+    func teardown() {
+        if let c = chevronItem { NSStatusBar.system.removeStatusItem(c) }
+        chevronItem = nil
+        chevronAXPosition = nil
+    }
 
-        chevronItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        chevronItem.autosaveName = "MenuBarFold.chevron"
-        if let button = chevronItem.button {
-            let image = NSImage(systemSymbolName: "rectangle.compress.vertical", accessibilityDescription: "MenuBarFold")
-                ?? NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "MenuBarFold")
-            image?.isTemplate = true
-            button.image = image
-            button.target = self
-            button.action = #selector(chevronClicked)
+    /// Called with the AX positions of our own extras. On macOS 27 the
+    /// system parks freshly created status items at a sentinel position —
+    /// recreating does not bring them back, so we only record the position
+    /// (the panel stays reachable via the global hotkey / the system ⌄ tray).
+    func observeOwnExtras(positions: [CGPoint]) {
+        let active = positions.first { $0.x >= 0 && $0.y >= 0 && $0.y < 40 }
+        if active == nil && !loggedParked {
+            loggedParked = true
+            log("chevron parked at sentinel — panel is reachable via ⌃⌥M")
         }
-        self.onChevronClick = onChevronClick
+        chevronAXPosition = active
     }
 
-    private var onChevronClick: (() -> Void)?
-
-    @objc private func chevronClicked() {
-        onChevronClick?()
+    /// Screen x-coordinate used to align the panel under the chevron.
+    /// nil when the chevron has no usable bar position (parked sentinel
+    /// coordinates like (7, 986) must never anchor the panel).
+    func anchorX() -> CGFloat? {
+        if let p = chevronAXPosition, p.x >= 0, p.y >= 0, p.y < 40 { return p.x }
+        return nil
     }
 
-    var isDividerExpanded = false
-
-    /// Expand (hide folded items) or collapse (reveal) the divider.
-    func setDividerExpanded(_ expanded: Bool) {
-        guard let dividerItem else { return }
-        dividerItem.length = expanded ? expandedLength : 6
-        isDividerExpanded = expanded
-        log("divider length set to \(dividerItem.length)")
+    private func makeChevron() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = "MenuBarFold.chevron"
+        item.behavior = [.removalAllowed, .terminationOnRemoval]
+        item.isVisible = true
+        if let button = item.button {
+            button.image = NSImage(
+                systemSymbolName: "chevron.down",
+                accessibilityDescription: "MenuBarFold"
+            )
+            button.imagePosition = .imageOnly
+            button.sendAction(on: [.leftMouseUp])
+        }
+        chevronItem = item
+        bindAction()
     }
+
+    private func bindAction() {
+        guard let button = chevronItem?.button else { return }
+        button.target = self
+        button.action = #selector(chevronClicked)
+    }
+
+    @objc private func chevronClicked() { onChevronClick?() }
 }

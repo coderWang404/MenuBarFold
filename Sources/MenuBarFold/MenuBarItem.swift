@@ -1,27 +1,38 @@
 import Cocoa
 import ApplicationServices
 
-/// A menu bar extra (status item) as seen through the window server,
-/// optionally merged with accessibility info from the real owning app.
+/// A menu bar extra as seen through its owning app's AXExtrasMenuBar.
+///
+/// On macOS 27 extras no longer have their own window-server windows — the
+/// system composites them inside MenuBarAgent — so identity and geometry
+/// come entirely from Accessibility.
 struct MenuBarItem: Identifiable, Hashable {
-    /// Window ID of the item's backing window (owned by ControlCenter on modern macOS).
-    /// nil if the item currently has no window (parked by the system, e.g. y == -1).
+    /// Where the system currently renders the item.
+    enum Placement: Hashable {
+        /// Right of the system collapse button — actually rendered.
+        case visible
+        /// Left of the collapse button — in the system's overflow stack
+        /// (several items may share overlapping positions there).
+        case collapsed
+        /// Sentinel position — removed by the system entirely.
+        case parked
+    }
+
+    /// Always nil on macOS 27 — extras have no window-server windows anymore.
     let windowID: CGWindowID?
 
-    /// The frame of the item's window in screen coordinates (top-left origin).
-    /// For windowless items, the position reported by Accessibility.
+    /// Logical frame in screen coordinates (top-left origin). Collapsed
+    /// items may overlap; parked items sit at sentinel positions.
     var frame: CGRect
 
-    /// Whether the item's window is on screen.
-    var isOnScreen: Bool
+    var isOnScreen: Bool { placement == .visible }
+    var placement: Placement
 
-    /// The window title (kCGWindowName) — often "Item-0" or a bundle-id-ish string.
-    var windowTitle: String
+    /// Unused on macOS 27 (kept for shape compatibility).
+    var windowTitle: String = ""
+    var windowOwnerPID: pid_t = 0
 
-    /// PID that owns the item window (usually ControlCenter on modern macOS).
-    var windowOwnerPID: pid_t
-
-    /// Real owning app, resolved via per-app AXExtrasMenuBar matching.
+    /// Real owning app — direct from the app that publishes the extra.
     var appPID: pid_t?
     var appName: String?
     var appBundleID: String?
@@ -30,57 +41,45 @@ struct MenuBarItem: Identifiable, Hashable {
     /// Accessibility attributes of the item.
     var axTitle: String?
     var axDescription: String?
+    var axIdentifier: String?
 
-    /// The AX element for the item (can perform AXPress).
+    /// The AX element for the item (can perform AXPress — works even when
+    /// the item is collapsed or parked, verified on macOS 27).
     var axElement: AXUIElement?
+
+    /// Index among extras that are indistinguishable by
+    /// (bundleID, title, identifier) — keeps stableID unique.
+    var occurrence: Int = 0
 
     var id: String { stableID }
 
-    /// Identity used for persistence. windowID changes across launches, so
-    /// prefer app identity + title. Falls back to window title + x bucket.
+    /// Identity used for persistence. Positions drift and overlap, so the
+    /// identity is app + AX attributes + occurrence index.
     var stableID: String {
-        if let appBundleID {
-            return "\(appBundleID)|\(axTitle ?? "")|\(windowTitle)"
-        }
-        return "w|\(windowTitle)|\(Int(frame.minX) / 20)"
+        let base = appBundleID ?? appName ?? "unknown"
+        return "\(base)|\(axTitle ?? "")|\(axIdentifier ?? "")|#\(occurrence)"
     }
 
     /// Name to show in the panel: prefer the app name; append the item's
     /// own title (e.g. badge text like "4") when it adds information.
     var displayName: String {
-        let base = appName ?? axTitle ?? (windowTitle.isEmpty || windowTitle == "Item-0" ? "未知项" : windowTitle)
+        let base = appName ?? axTitle ?? "未知项"
         if let axTitle, !axTitle.isEmpty, axTitle != base {
             return "\(base) · \(axTitle)"
         }
         return base
     }
 
-    /// Whether the item has a live window that can be event-targeted.
-    var hasWindow: Bool { windowID != nil }
+    var isParked: Bool { placement == .parked }
 
-    /// Whether the item is parked (removed from the bar by the system; AX says y < 0).
-    var isParked: Bool { windowID == nil }
-
+    /// A visible item can be dragged into the system collapse zone.
+    /// Apple's own extras (Siri/Spotlight/input menu/clock…) don't accept
+    /// ⌘-drags on macOS 27 — identified by their com.apple.* bundle IDs
+    /// since their AX identifiers are empty and titles are localized.
     var isMovable: Bool {
-        Self.immovableWindowTitles.contains(windowTitle) == false &&
-        Self.immovableAXIDs.contains(axDescription ?? "") == false
+        placement == .visible &&
+        !(appBundleID?.hasPrefix("com.apple.") ?? false)
     }
 
-    var canBeHidden: Bool {
-        Self.nonHideableWindowTitles.contains(windowTitle) == false
-    }
-
-    // MARK: blacklists (mirroring Ice's known special items)
-
-    private static let immovableWindowTitles: Set<String> = [
-        "Clock", "Siri", "BentoBox-0", "Menubar",
-    ]
-    private static let immovableAXIDs: Set<String> = [
-        "com.apple.menuextra.clock",
-        "com.apple.menuextra.controlcenter",
-        "com.apple.menuextra.siri",
-    ]
-    private static let nonHideableWindowTitles: Set<String> = [
-        "AudioVideoModule", "FaceTime", "MusicRecognition",
-    ]
+    var canBeHidden: Bool { isMovable }
 }

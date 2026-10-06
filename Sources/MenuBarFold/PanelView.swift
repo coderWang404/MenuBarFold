@@ -34,7 +34,7 @@ struct PanelView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
-            Text("\(manager.foldedItems.count) 项已折叠")
+            Text("\(manager.collapsedItems.count) 项已折叠")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -44,12 +44,12 @@ struct PanelView: View {
 
     @ViewBuilder
     private var foldedSection: some View {
-        if !manager.foldedItems.isEmpty {
-            Text("已折叠 — 点击使用")
+        if !manager.collapsedItems.isEmpty {
+            Text("已折叠 — 点击使用（展开请拖出系统 ⌄ 区）")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 2)
-            ForEach(manager.foldedItems) { item in
+            ForEach(manager.collapsedItems) { item in
                 ItemRow(item: item, actionTitle: "展开") {
                     Task { await manager.unfold(item) }
                 } onUse: {
@@ -62,16 +62,15 @@ struct PanelView: View {
 
     @ViewBuilder
     private var otherSection: some View {
-        if !manager.otherItems.isEmpty {
+        if !manager.visibleItems.isEmpty {
             Text("顶栏项")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.top, 6)
                 .padding(.bottom, 2)
-            ForEach(manager.otherItems) { item in
+            ForEach(manager.visibleItems) { item in
                 ItemRow(
                     item: item,
-                    badge: item.isOnScreen ? nil : "被遮挡",
                     actionTitle: item.canBeHidden ? "折叠" : nil
                 ) {
                     Task { await manager.fold(item) }
@@ -94,28 +93,30 @@ struct PanelView: View {
             ForEach(manager.parkedItems) { item in
                 ItemRow(item: item, badge: "已移除", actionTitle: nil, dimmed: true) {
                 } onUse: {
+                    controller.close()
+                    Task { await manager.use(item) }
                 }
             }
         }
     }
 
     private var footer: some View {
-        HStack {
-            if !manager.foldedItems.isEmpty {
-                Button("全部展开") {
-                    Task {
-                        for item in manager.foldedItems {
-                            await manager.unfold(item)
-                        }
-                    }
+        VStack(alignment: .leading, spacing: 4) {
+            if let notice = manager.notice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            HStack {
+                Text("⌃⌥M 开关面板")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("退出") {
+                    NSApp.terminate(nil)
                 }
                 .buttonStyle(.borderless)
             }
-            Spacer()
-            Button("退出") {
-                NSApp.terminate(nil)
-            }
-            .buttonStyle(.borderless)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -130,7 +131,14 @@ private struct ItemRow: View {
     let onAction: () -> Void
     let onUse: () -> Void
 
-    @State private var isHovering = false
+    // @State is a compiler macro in the macOS 27 SDK and its plugin isn't
+    // shipped with Command Line Tools — expand the property-wrapper storage
+    // manually (identical desugaring: `_x` storage + computed accessor).
+    private var _isHovering = State(initialValue: false)
+    private var isHovering: Bool {
+        get { _isHovering.wrappedValue }
+        nonmutating set { _isHovering.wrappedValue = newValue }
+    }
 
     var body: some View {
         HStack(spacing: 8) {

@@ -12,12 +12,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appState = AppState()
         self.appState = appState
 
-        appState.controlItems.setup { [weak appState] in
+        appState.controlItems.setup()
+        appState.controlItems.onChevronClick = { [weak appState] in
             appState?.panelController.toggle()
         }
         appState.itemManager.performSetup(appState: appState)
 
         ensureAccessibilityPermission()
+
+        // Global hotkey ⌃⌥M toggles the panel — needed because on macOS 27
+        // the system may park our status item where it can't be clicked.
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak appState] event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags == [.control, .option], event.keyCode == 46 {
+                Task { @MainActor in appState?.panelController.toggle() }
+            }
+        }
 
         log("didFinishLaunching")
 
@@ -27,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        appState?.controlItems.setDividerExpanded(false)
+        appState?.controlItems.teardown()
     }
 
     /// Prompts for Accessibility permission if needed; menu bar item moves

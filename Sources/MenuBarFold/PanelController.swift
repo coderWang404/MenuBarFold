@@ -52,15 +52,20 @@ final class PanelController: NSObject {
         let height = min(max(fitting.height, 80), 480)
         panel.setContentSize(NSSize(width: width, height: height))
 
-        // Anchor below the chevron button.
-        if let buttonWindow = appState.controlItems.chevronItem?.button?.window {
-            let bf = buttonWindow.frame // AppKit coords (bottom-left origin)
-            let x = max(4, bf.midX - width / 2)
-            panel.setFrameOrigin(NSPoint(x: x, y: bf.minY - height - 4))
-        } else if let screen = NSScreen.main {
+        // Anchor below the chevron. On macOS 27 the status item's button
+        // lives in a full-width host window, so use the chevron's AX
+        // position (top-left screen coords) instead of the window frame.
+        guard let screen = NSScreen.main else { return }
+        let menuBarHeight: CGFloat = 33
+        let panelTopY = screen.frame.maxY - menuBarHeight - 4 // AppKit: bottom-left origin
+        if let ax = appState.controlItems.anchorX() {
+            let centerX = ax + 11 // chevron is ~22pt wide
+            let x = min(max(4, centerX - width / 2), screen.frame.maxX - width - 4)
+            panel.setFrameOrigin(NSPoint(x: x, y: panelTopY - height))
+        } else {
             panel.setFrameOrigin(NSPoint(
                 x: screen.frame.maxX - width - 8,
-                y: screen.frame.maxY - height - 8
+                y: panelTopY - height
             ))
         }
 

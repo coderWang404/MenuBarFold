@@ -1,7 +1,7 @@
 # MenuBarFold — macOS 顶栏折叠管理工具
 
 MacBook 刘海会遮挡菜单栏图标。本工具在菜单栏放一个 chevron 图标，点击弹出下拉面板：
-可逐项折叠/展开顶栏图标；点击已折叠项会把它临时移回菜单栏、模拟点击弹出菜单，15s 后自动收回。
+可逐项折叠/展开顶栏图标；点击任意项通过 AXPress 直接触发其菜单。
 
 ## 构建与运行
 
@@ -17,69 +17,67 @@ open build/MenuBarFold.app        # 运行（无 Dock 图标，LSUIElement）
 ```bash
 /tmp/post_notif foldFirst    # 折叠"顶栏项"列表第一项（spike/post_notif.swift 可重建）
 /tmp/post_notif unfoldFirst  # 展开折叠区第一项
-/tmp/post_notif unfoldMatch "id:<needle>"  # 展开 stableID 包含 needle 的折叠项（当前实现读 userInfo["id"]）
-/tmp/post_notif useFirst     # 临时移回+点击折叠区第一项
-/tmp/post_notif togglePanel  # 开关下拉面板
+/tmp/post_notif unfoldMatch "qq"   # 展开 stableID/displayName 包含 needle 的折叠项
+/tmp/post_notif useFirst     # AXPress 折叠区第一项
+/tmp/post_notif togglePanel  # 开关下拉面板（快捷键 ⌃⌥M 等价）
 ```
 
-`spike/` 目录是独立验证工具：`enum_test`（枚举菜单栏窗口）、`ax_apps_test`（各 App 的
-AXExtrasMenuBar）、`move_test`（合成 ⌘-drag 移动）、`click_test`（合成点击）。
+## 核心机制（macOS 27 版 —— 纯 AX，无窗口枚举）
 
-## 核心机制（参考开源项目 Ice，代码自写）
+**macOS 27 架构剧变**：`MenuBarAgent` 进程自己合成所有菜单栏项。
+`CGSGetProcessMenuBarWindowList` 已失效（所有进程都只返回 Menubar 主窗口），
+项不再有独立窗口，`windowID` 定向事件和"分隔符挤出屏幕"整套机制全部作废。
 
-- **枚举（两层，性能关键）**：
-  - *几何层*（主线程，每 5s/开面板，~20ms）：`CGSGetProcessMenuBarWindowList` +
-    `CGWindowListCopyWindowInfo(.optionAll)` + `CGSGetScreenRectForWindow` → 窗口 ID/位置/分区。
-    ⚠️ `.optionIncludingWindow` 对**离屏**窗口返回空，不能用来逐窗口查询。
-  - *身份层*（后台线程，按需+60s 定时）：逐 App `AXExtrasMenuBar`（约 120 个 App 的同步 AX IPC，
-    主线程跑会卡 UI 数秒）。加 `AXUIElementSetMessagingTimeout(0.5s)` 防个别 App 不响应，
-    `AXUIElementCopyMultipleAttributeValues` 批量取属性。结果按 windowID 缓存，
-    只在**新 windowID 出现**时才触发（sawNewWindow），避免无法匹配项导致无限重试。
-  - *匹配*：窗口 frame ∩ AX 位置 ±3px → 兜底：±45px 最近位置配对（AX 位置会漂移；
-    千万别放宽到 ~90px——图标间距仅 32-40px，会把相邻项标错名，出现"点 A 开 B"）。
-    `_AXUIElementGetWindow`（Ice 的精确匹配法）在 macOS 26 已失效（全返回 -25201）。
-    折叠项的 AX 位置**实时跟踪**窗口位置，无需特殊处理。排除 own extras 与
-    isParkedPosition（y<0 / (0,982)）哨兵项。
-- **启动规范化+修复**：分隔符槽位在重启间会漂移 → 物理折叠集≠持久化集。`restoreFolds`
-  先按 foldedIDs 折回 → 不在 foldedIDs 的物理折叠项全部展开 → **修复：onscreen 且
-  minX < boundary-20 的项（压在应用菜单上）移回可见簇**，保证折叠集=用户选择且
-  可见区无错位项。⚠️ 必须先等身份合并完成（stableID 含 bundleID）。
-- **展开落点**：`visibleDropDestination()` = 可见簇最左项 leftOf（x≥boundary）。
-  ⚠️ 不要用"分隔符 rightOf"——那里 x≈0-250 是应用菜单区，图标会画在菜单上。
-  `use()` 调用前必须 `refresh()` + 按 stableID 重新解析行对象（wid 会被重建）。
-- **隐藏**：分隔符 `NSStatusItem.length = 屏幕宽`，把左侧有序的项挤出屏幕（窗口仍存活）。
-  分区判定：`item.frame.maxX <= divider.frame.minX` → 折叠区。
-- **移动**：合成 ⌘-drag `CGEvent`，关键是用私有字段直接指定目标窗口——
-  `.mouseEventWindowUnderMousePointer`、`.windowID`(0x33)、`.eventTargetUnixProcessID`，
-  因此鼠标坐标可在屏幕外（grab 点 20000,20000），被隐藏项也能拖动。post 到 `.cgSessionEventTap`。
-- **使用折叠项**：移到可见区最左侧有空位项的左边（boundary = `auxiliaryTopRightArea.minX`，
-  即刘海右缘）→ 点击 → 定时器到点拖回分隔符左侧。
-- **持久化**：`foldedIDs`（`bundleID|axTitle|windowTitle`）存 UserDefaults，启动恢复。
-- **不可移动项**：Clock / Siri / BentoBox（控制中心自身）等黑名单；`AudioVideoModule`、
-  `FaceTime`、`MusicRecognition` 不可折叠。
+- **枚举 = 逐 App `AXExtrasMenuBar`**（后台线程，约 120 个 App 的同步 AX IPC，
+  8s 定时 + 开面板触发，主线程不阻塞）。每个 extra 自带真实归属
+  （appPID/bundleID/名称/图标）——**身份是权威的，不是位置猜出来的**。
+- **分类**：MenuBarAgent 自己的 `AXButton` extra（"显示隐藏菜单栏项目"，
+  约 x=890）是系统折叠边界 `collapseBoundary`：
+  - `x ≥ boundary` → 可见（顶栏项）
+  - `x < boundary 且 y∈[0,45]` → 已折叠（系统溢出区，可能渲染但不可命中）
+  - `x<0 / y<0 / y>45 / (7,986.5)` → 已移除（哨兵位，系统彻底收纳）
+- **点击使用 = `AXPress`**：对可见、折叠、哨兵位项都有效——App 照样弹菜单。
+  无需"临时移回再收回"那一套。
+- **折叠 = `AXUIElementSetAttributeValue(AXPosition)`** ⚠️关键发现：
+  写 AXPosition 返回错误码 **但位置真实生效**（写边界内 ~boundary-30 即可折入）。
+  兜底：坐标 ⌘-drag（必须先 `AXUIElementCopyElementAtPosition` 扫出**渲染**位置——
+  AX 位置是逻辑的，系统重排后可偏离 ~60px，按 AX 中点抓会抓到隔壁项！）。
+- **展开 = 同样 AX 写位置**（写到 boundary+60, y=4.5，系统会吸附到合法槽位）。
+  折叠区项不可命中（hit-test -25208），坐标拖拽对其无效；AX 写位置是目前唯一
+  可靠路径。
+- **验证 = 轮询**：移动后 AX 位置更新有延迟，positionCheck 按 250ms×8 轮询。
+- **自己的 chevron**：macOS 27 下**新建 NSStatusItem 一律进哨兵位**（写
+  autosaveName + Preferred Position 偏好也没用）。所以面板入口是
+  **全局快捷键 ⌃⌥M**（`addGlobalMonitorForEvents`）+ 哨兵位 chevron 仍响应
+  AXPress（用户若能在系统 ⌄ 托盘里找到它，点击也能开）。
+- **持久化**：foldedIDs = `bundleID|axTitle|axIdentifier|#occurrence`，
+  启动后对仍可见的持久化项重放折叠。
 
 ## 已知限制
 
-- 被系统彻底移除的项（AX 位置 y=-1，无窗口）显示为"已移除"灰色行，需重启对应 App 恢复。
+- "展开"依赖 AX 写位置；若未来系统收紧该属性，折叠区项将无法自动展开
+  （坐标拖拽对堆叠项无效——已在 hit-test / 菜单开启态 / 宿主窗口定向三种路径验证）。
+- 系统 ⌄ 按钮（MenuBarAgent AXButton）不响应任何合成点击/AX 动作——系统托盘
+  展开只能用户手动。
 - Ad-hoc 签名：重编译后 cdhash 变化，辅助功能授权可能要重新勾选。
-- 多屏/多 Space 未处理；折叠顺序在重启后按持久化集合恢复（精确位置不保证）。
-- macOS 私有 API，系统升级有失效风险。
+- macOS 27 SDK 把 `@State` 改成了宏，CLT 不带 SwiftUIMacros 插件——
+  PanelView 里的悬停态是手动展开的 `State(initialValue:)` 存储写法。
 
 ## 文件结构
 
 ```
 Sources/MenuBarFold/
   main.swift               入口（NSApplication + AppDelegate，.accessory）
-  AppDelegate.swift        启动编排 + 辅助功能权限引导
+  AppDelegate.swift        启动编排 + 权限引导 + ⌃⌥M 全局热键
   AppState.swift           全局状态
-  Bridging.swift           私有 CGS API（@_silgen_name）
-  WindowInfo.swift         CGWindowList 包装
-  MenuBarItem.swift        项模型 + 黑名单 + displayName
-  MenuBarItemManager.swift 枚举/分区/折叠/展开/tempShow/自动收回/持久化 + 调试钩子
-  EventPoster.swift        窗口定向合成事件（move/click）
-  ControlItems.swift       chevron + 分隔符 NSStatusItem
-  PanelController.swift    NSPanel 锚定 chevron 下方
-  PanelView.swift          SwiftUI 下拉列表
+  Bridging.swift           私有 CGS API（macOS 27 已失效，保留备查）
+  WindowInfo.swift         CGWindowList 包装（同上）
+  MenuBarItem.swift        项模型 + placement 分类 + stableID
+  MenuBarItemManager.swift AX 枚举/分类/折叠/展开/AXPress/持久化 + 调试钩子
+  EventPoster.swift        坐标 ⌘-drag（折叠兜底）
+  ControlItems.swift       chevron NSStatusItem（哨兵位感知）
+  PanelController.swift    NSPanel 锚定（AX 位置优先，右侧兜底）
+  PanelView.swift          SwiftUI 下拉列表（三区：已折叠/顶栏项/已移除）
   SettingsStore.swift      UserDefaults
   Log.swift                stderr 日志
 ```

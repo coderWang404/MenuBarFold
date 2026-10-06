@@ -1,54 +1,57 @@
 import Cocoa
 import ApplicationServices
 
-/// A menu bar item discovered through an app's AXExtrasMenuBar — carries the
-/// real owning app, which window-owner info can no longer provide (all extras
-/// are hosted by ControlCenter on modern macOS).
+/// A menu bar extra discovered through an app's AXExtrasMenuBar.
 ///
 /// Marked `@unchecked Sendable`: AXUIElement/NSImage are CF/ObjC reference
 /// types that are safe to carry across threads as read-only values.
 private struct AXExtraInfo: @unchecked Sendable {
     let element: AXUIElement
-    /// Window ID resolved directly via _AXUIElementGetWindow — nil when the
-    /// item currently has no window (parked by the system).
-    let windowID: CGWindowID?
     let position: CGPoint
     let size: CGSize
     let title: String?
     let description: String?
     let identifier: String?
+    let role: String?
     let appPID: pid_t
     let appName: String?
     let appBundleID: String?
     let appIcon: NSImage?
+    /// Index among extras identical by (bundleID, title, identifier).
+    var occurrence: Int = 0
 
-    /// True when the position is a known "removed from menu bar" sentinel.
+    /// Sentinel positions for items removed from the bar by the system:
+    /// (-1, 970+), (7, 986.5), offscreen-left (x < 0) from legacy moves.
     var isParkedPosition: Bool {
-        position.y < 0 || position == CGPoint(x: 0, y: 982)
+        position.x < 0 || position.y < 0 || position.y > 45
+    }
+
+    var stableID: String {
+        let base = appBundleID ?? appName ?? "unknown"
+        return "\(base)|\(title ?? "")|\(identifier ?? "")|#\(occurrence)"
     }
 }
 
-/// Tracks a folded item that was temporarily moved back on screen.
-private struct TempShownContext {
-    let itemID: String
-    let windowID: CGWindowID
-    let task: Task<Void, Never>
-}
-
+/// Enumerates menu bar extras purely via Accessibility, classifies them
+/// against the system's collapse button, and performs fold/use via
+/// coordinate ⌘-drag and AXPress.
+///
+/// macOS 27 architecture: MenuBarAgent composites all extras itself; the
+/// overflow stack lives left of its ⌄ button (multiple items share
+/// overlapping positions there — they are not hit-testable, so unfolding
+/// is best-effort; AXPress remains the reliable way to use them).
 @MainActor
 final class MenuBarItemManager: ObservableObject {
-    /// Items left of the fold divider (hidden by us).
-    @Published private(set) var foldedItems: [MenuBarItem] = []
+    /// Items in the system's overflow zone (left of the ⌄ button).
+    @Published private(set) var collapsedItems: [MenuBarItem] = []
 
-    /// Items right of the fold divider (managed by macOS; some may still be
-    /// clipped off-screen by the notch / lack of space).
-    @Published private(set) var otherItems: [MenuBarItem] = []
+    /// Items rendered in the bar (right of the ⌄ button).
+    @Published private(set) var visibleItems: [MenuBarItem] = []
 
-    /// Items that exist in an app's AXExtrasMenuBar but have no window
-    /// (system removed them entirely; e.g. AX position y < 0).
+    /// Items at sentinel positions (fully removed by the system).
     @Published private(set) var parkedItems: [MenuBarItem] = []
 
-    /// Persistent IDs of items the user chose to fold. Reapplied on relaunch.
+    /// Persistent IDs of items the user chose to fold.
     @Published private(set) var foldedIDs: Set<String> {
         didSet { SettingsStore.shared.foldedIDs = foldedIDs }
     }
@@ -56,22 +59,21 @@ final class MenuBarItemManager: ObservableObject {
     /// Whether Accessibility permission is granted.
     @Published private(set) var isTrusted: Bool = false
 
+    /// Transient footer message (e.g. when an unfold can't be automated).
+    @Published private(set) var notice: String?
+
     weak var appState: AppState?
 
-    /// Resolved app identity per item window (filled by background AX passes).
-    private var identityByWID = [CGWindowID: AXExtraInfo]()
+    /// Left edge of the system collapse ⌄ button — items left of it are
+    /// in the overflow zone. Recomputed on every AX pass; falls back to
+    /// a conservative estimate when the button isn't published yet.
+    private var collapseBoundary: CGFloat = 880
 
-    /// AX extras that currently have no item window (parked items).
-    private var unmatchedAX = [AXExtraInfo]()
-
-    private var tempShown = [String: TempShownContext]()
+    private var refreshInFlight = false
+    private var refreshAgain = false
     private var refreshTimer: Timer?
-    private var identityTimer: Timer?
-    private var identityInFlight = false
-    /// Window IDs ever observed; a *new* one triggers an identity pass.
-    private var seenWIDs = Set<CGWindowID>()
-    private var hasPlacedDivider = false
     private var hasRestoredFolds = false
+    private var noticeTask: Task<Void, Never>?
 
     init() {
         foldedIDs = SettingsStore.shared.foldedIDs
@@ -81,32 +83,21 @@ final class MenuBarItemManager: ObservableObject {
         self.appState = appState
         isTrusted = AXIsProcessTrusted()
 
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didLaunchApplicationNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
-                self?.scheduleIdentityRefresh()
-            }
-        }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
-                self?.scheduleIdentityRefresh()
+        for name in [
+            NSWorkspace.didLaunchApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification,
+        ] {
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.refresh() }
             }
         }
 
-        // Light geometry refresh — pure window-server calls, no AX IPC.
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        // Positions drift as the system manages the bar; AX enumeration is
+        // a background pass so even an 8s cadence stays off the main thread.
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
-        }
-        // Slow identity refresh — names/icons drift rarely.
-        identityTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.scheduleIdentityRefresh() }
         }
 
         // Debug/testing hooks via distributed notifications.
@@ -120,20 +111,23 @@ final class MenuBarItemManager: ObservableObject {
                 guard let self else { return }
                 switch command {
                 case "foldFirst":
-                    if let item = self.otherItems.first(where: { $0.isMovable && $0.hasWindow }) {
+                    if let item = self.visibleItems.first(where: \.isMovable) {
                         await self.fold(item)
                     }
                 case "unfoldFirst":
-                    if let item = self.foldedItems.first {
+                    if let item = self.collapsedItems.first {
                         await self.unfold(item)
                     }
                 case "unfoldMatch":
                     if let needle = arg,
-                       let item = self.foldedItems.first(where: { $0.stableID.contains(needle) }) {
+                       let item = self.collapsedItems.first(where: {
+                           $0.stableID.localizedCaseInsensitiveContains(needle)
+                           || $0.displayName.localizedCaseInsensitiveContains(needle)
+                       }) {
                         await self.unfold(item)
                     }
                 case "useFirst":
-                    if let item = self.foldedItems.first {
+                    if let item = self.collapsedItems.first {
                         await self.use(item)
                     }
                 case "togglePanel":
@@ -147,292 +141,408 @@ final class MenuBarItemManager: ObservableObject {
 
     /// Called once our control items exist in the menu bar.
     func controlItemsDidAppear() async {
-        // Give the window server a beat to settle after item creation.
-        try? await Task.sleep(for: .milliseconds(600))
-        refresh()
-        await placeDividerIfNeeded()
-        appState?.controlItems.setDividerExpanded(true)
-        refresh()
-        await placeChevronIfNeeded()
-        refresh()
-        log("ready: folded=\(foldedItems.count) other=\(otherItems.count) parked=\(parkedItems.count)")
-        // Persisted folds need resolved identities (stableID contains the
-        // bundle ID), so the first AX pass must complete before restoring.
-        await refreshIdentities()
+        try? await Task.sleep(for: .milliseconds(800))
+        await refreshNow()
         await restoreFolds()
+        log("ready: visible=\(visibleItems.count) collapsed=\(collapsedItems.count) parked=\(parkedItems.count) boundary=\(Int(collapseBoundary))")
     }
 
-    // MARK: - Geometry refresh (fast, main thread)
+    // MARK: - Refresh (AX enumeration, background)
 
-    /// Rebuilds item lists from window-server state only — no AX IPC, so it's
-    /// safe to call on every panel open / timer tick.
+    /// Kicks an asynchronous AX enumeration; returns immediately. Safe to
+    /// call on every panel open / timer tick — requests coalesce.
     func refresh() {
-        let start = ContinuousClock.now
         isTrusted = AXIsProcessTrusted()
+        guard !refreshInFlight else {
+            refreshAgain = true
+            return
+        }
+        refreshInFlight = true
+        Task { await finishRefresh() }
+    }
 
-        let windowIDs = Bridging.menuBarItemWindowIDs()
-        let infos = WindowInfo.allByWindowID()
+    /// Awaitable variant for launch sequencing.
+    private func refreshNow() async {
+        isTrusted = AXIsProcessTrusted()
+        if refreshInFlight { return }
+        refreshInFlight = true
+        await finishRefresh()
+    }
 
-        var items = [MenuBarItem]()
-        var sawNewWindow = false
+    private func finishRefresh() async {
+        let extras = await Task.detached { Self.enumerateAXExtras() }.value
+        refreshInFlight = false
+        if refreshAgain {
+            refreshAgain = false
+            refresh()
+            return
+        }
+        apply(extras: extras)
+    }
 
-        for wid in windowIDs {
-            guard let info = infos[wid] else { continue }
-            if info.title == "Menubar" { continue }
+    private func apply(extras: [AXExtraInfo]) {
+        let ownBundleID = Bundle.main.bundleIdentifier
+        var ownPositions = [CGPoint]()
+        var boundary: CGFloat?
+        var collapsed = [MenuBarItem]()
+        var visible = [MenuBarItem]()
+        var parked = [MenuBarItem]()
 
-            // Our own items: record their window-server IDs, skip management.
-            if let title = info.title, title.hasPrefix(ControlItems.ownTitlePrefix) {
-                if title.hasSuffix("divider") {
-                    appState?.controlItems.dividerWindowID = wid
-                } else if title.hasSuffix("chevron") {
-                    appState?.controlItems.chevronWindowID = wid
+        for extra in extras {
+            // Our own chevron — feed its position to ControlItems for
+            // panel anchoring and parked-state recovery, never list it.
+            if extra.appBundleID == ownBundleID {
+                ownPositions.append(extra.position)
+                continue
+            }
+            // MenuBarAgent's own chrome (clock/battery/CC groups + the ⌄
+            // button) isn't user-manageable; the button marks the boundary.
+            if extra.appBundleID == "com.apple.MenuBarAgent" {
+                if extra.role == "AXButton", extra.size.width < 60 {
+                    boundary = min(boundary ?? .greatestFiniteMagnitude, extra.position.x)
                 }
                 continue
             }
-            guard let frame = Bridging.frame(of: wid), frame.height >= 20, frame.height <= 60 else {
-                continue
-            }
+            if extra.size == .zero { continue }
 
-            if !seenWIDs.contains(wid) {
-                seenWIDs.insert(wid)
-                sawNewWindow = true
-            }
-
-            let identity = identityByWID[wid]
-
-            var item = MenuBarItem(
-                windowID: wid,
-                frame: frame,
-                isOnScreen: info.isOnScreen,
-                windowTitle: info.title ?? "",
-                windowOwnerPID: info.ownerPID,
-                appPID: nil, appName: nil, appBundleID: nil, appIcon: nil,
-                axTitle: nil, axDescription: nil, axElement: nil
-            )
-            if let identity {
-                apply(identity: identity, to: &item)
-            }
-            items.append(item)
-        }
-
-        // Parked items: AX extras that no longer have a window.
-        parkedItems = unmatchedAX.map { extra in
-            MenuBarItem(
+            let item = MenuBarItem(
                 windowID: nil,
                 frame: CGRect(origin: extra.position, size: extra.size),
-                isOnScreen: false,
-                windowTitle: "",
-                windowOwnerPID: 0,
+                placement: .visible, // provisional, classified below
                 appPID: extra.appPID,
                 appName: extra.appName,
                 appBundleID: extra.appBundleID,
                 appIcon: extra.appIcon,
                 axTitle: extra.title,
                 axDescription: extra.description,
-                axElement: extra.element
+                axIdentifier: extra.identifier,
+                axElement: extra.element,
+                occurrence: extra.occurrence
             )
-        }
-
-        // Section split by divider position.
-        if let dividerWID = appState?.controlItems.dividerWindowID,
-           let dividerFrame = Bridging.frame(of: dividerWID) {
-            foldedItems = items
-                .filter { $0.frame.maxX <= dividerFrame.minX }
-                .sorted { $0.frame.minX < $1.frame.minX }
-            otherItems = items
-                .filter { $0.frame.maxX > dividerFrame.minX }
-                .sorted { $0.frame.minX < $1.frame.minX }
-        } else {
-            items.sort { $0.frame.minX < $1.frame.minX }
-            foldedItems = []
-            otherItems = items
-        }
-
-        if sawNewWindow {
-            scheduleIdentityRefresh()
-        }
-
-        let elapsed = ContinuousClock.now - start
-        if elapsed > .milliseconds(50) {
-            log("refresh took \(elapsed) (slow)")
-        }
-    }
-
-    private func apply(identity: AXExtraInfo, to item: inout MenuBarItem) {
-        item.appPID = identity.appPID
-        item.appName = identity.appName
-        item.appBundleID = identity.appBundleID
-        item.appIcon = identity.appIcon
-        item.axTitle = identity.title
-        item.axDescription = identity.description
-        item.axElement = identity.element
-    }
-
-    // MARK: - Identity refresh (slow, background thread)
-
-    /// Kicks a background AX enumeration and merges results when done.
-    /// Coalesces concurrent requests.
-    private func scheduleIdentityRefresh() {
-        guard !identityInFlight else { return }
-        identityInFlight = true
-        Task { await refreshIdentities() }
-    }
-
-    /// Runs one AX enumeration off the main thread and merges the result.
-    private func refreshIdentities() async {
-        let extras = await Task.detached {
-            Self.enumerateAXExtras()
-        }.value
-        // Read frames NOW — the enumeration took seconds and items may have
-        // moved (startup placement/repair). A stale snapshot mis-pairs.
-        let windows = (foldedItems + otherItems).compactMap { item -> (wid: CGWindowID, frame: CGRect)? in
-            guard let wid = item.windowID, let frame = Bridging.frame(of: wid) else { return nil }
-            return (wid, frame)
-        }
-        mergeIdentities(extras: extras, windows: windows)
-    }
-
-    /// Matches freshly enumerated AX extras against item windows and rebuilds
-    /// the published lists. Matching is primarily by the exact window ID that
-    /// `_AXUIElementGetWindow` reports; position is only a fallback.
-    private func mergeIdentities(extras: [AXExtraInfo], windows: [(wid: CGWindowID, frame: CGRect)]) {
-        defer { identityInFlight = false }
-        var newIdentities = [CGWindowID: AXExtraInfo]()
-        var used = Set<Int>()
-        let liveWIDs = Set(windows.map(\.wid))
-
-        // Exact matches first (dead on macOS 26, kept for future-proofing).
-        for (index, extra) in extras.enumerated() {
-            if let wid = extra.windowID {
-                newIdentities[wid] = extra
-                used.insert(index)
-            }
-        }
-
-        let sortedWindows = windows.sorted { $0.frame.minX > $1.frame.minX }
-
-        // Strict position matches = confident anchors.
-        for window in sortedWindows where newIdentities[window.wid] == nil {
-            for (index, extra) in extras.enumerated()
-            where !used.contains(index) && !extra.isParkedPosition {
-                if extra.position.x >= window.frame.minX - 3,
-                   extra.position.x <= window.frame.maxX + 3,
-                   abs(extra.position.y - window.frame.minY) < 12 {
-                    newIdentities[window.wid] = extra
-                    used.insert(index)
-                    break
-                }
-            }
-        }
-
-        // Anchor-constrained alignment for the remainder: a candidate extra
-        // must sort order-consistently between the two confirmed anchors
-        // bracketing this window. Ambiguous leftovers stay unidentified —
-        // an "未知项" row is better than a wrong app name (and a wrong click).
-        let anchored = sortedWindows.filter { newIdentities[$0.wid] != nil }
-        for window in sortedWindows where newIdentities[window.wid] == nil {
-            let rightAnchor = anchored.last(where: { $0.frame.minX > window.frame.minX })
-            let leftAnchor = anchored.first(where: { $0.frame.minX < window.frame.minX })
-            let xHi = rightAnchor.map { newIdentities[$0.wid]!.position.x } ?? .greatestFiniteMagnitude
-            let xLo = leftAnchor.map { newIdentities[$0.wid]!.position.x } ?? -.greatestFiniteMagnitude
-
-            var candidates = [(index: Int, distance: CGFloat)]()
-            for (index, extra) in extras.enumerated()
-            where !used.contains(index) && !extra.isParkedPosition {
-                guard extra.position.x > xLo, extra.position.x < xHi,
-                      abs(extra.position.y - window.frame.minY) < 12
-                else { continue }
-                candidates.append((index, abs(extra.position.x - window.frame.midX)))
-            }
-            candidates.sort { $0.distance < $1.distance }
-            if let first = candidates.first, first.distance < 45,
-               candidates.count == 1 || candidates[1].distance - first.distance > 20 {
-                newIdentities[window.wid] = extras[first.index]
-                used.insert(first.index)
-            }
-        }
-
-        // Parked: extras with no live window at all (excluding our own
-        // control items, which we deliberately skip during matching).
-        let ownBundleID = Bundle.main.bundleIdentifier
-        let unmatched = extras.enumerated().filter {
-            !used.contains($0.offset)
-                && !liveWIDs.contains($0.element.windowID ?? 0)
-                && $0.element.appBundleID != ownBundleID
-        }.map(\.element)
-
-        log("identities: matched=\(newIdentities.count) parked=\(unmatched.count) extras=\(extras.count)")
-        for window in sortedWindows {
-            if let id = newIdentities[window.wid] {
-                log("  pair wid=\(window.wid)@\(Int(window.frame.minX))..\(Int(window.frame.maxX)) → \(id.appName ?? "?")@\(Int(id.position.x))")
+            if extra.isParkedPosition {
+                var it = item; it.placement = .parked
+                parked.append(it)
             } else {
-                log("  pair wid=\(window.wid)@\(Int(window.frame.minX))..\(Int(window.frame.maxX)) → ???")
+                // Classification needs the boundary; collect, split after.
+                visible.append(item) // staging — real split below
             }
         }
-        identityByWID = newIdentities
-        unmatchedAX = unmatched
+
+        if let boundary {
+            collapseBoundary = boundary
+        } else {
+            // No collapse button published yet — everything is visible.
+            collapseBoundary = NSScreen.main?.auxiliaryTopRightArea?.minX ?? 880
+        }
+
+        // `visible` above was a staging list; split it against the boundary.
+        let staged = visible
+        visible = staged.filter { $0.frame.minX >= collapseBoundary - 1 }
+        collapsed = staged.filter { $0.frame.minX < collapseBoundary - 1 }.map {
+            var it = $0; it.placement = .collapsed; return it
+        }
+        visible.sort { $0.frame.minX > $1.frame.minX }
+        collapsed.sort { $0.frame.minX < $1.frame.minX }
+        parked.sort { ($0.appName ?? "") < ($1.appName ?? "") }
+
+        collapsedItems = collapsed
+        visibleItems = visible
+        parkedItems = parked
+        appState?.controlItems.observeOwnExtras(positions: ownPositions)
+    }
+
+    // MARK: - Fold / unfold
+
+    /// Folds a visible item into the system overflow zone (left of ⌄).
+    ///
+    /// Primary path: AX-set the position attribute — macOS 27 accepts it
+    /// (returns an error code yet still applies). Fallback: coordinate
+    /// ⌘-drag from the item's *rendered* position (AX positions are logical
+    /// and drift from the rendered slot after the system rebalances).
+    func fold(_ item: MenuBarItem) async {
+        guard item.placement == .visible, item.isMovable else { return }
+        let collapsedPoint = CGPoint(x: collapseBoundary - 30, y: 4.5)
+
+        if let el = item.axElement {
+            Self.setAXPosition(el, to: collapsedPoint)
+        }
+        var moved = await positionCheck(item) { pos, _ in
+            pos.x < self.collapseBoundary - 1 || self.isParked(pos)
+        }
+        if !moved {
+            guard let grab = await renderedCenterX(of: item) else {
+                log("fold \(item.stableID): item not rendered at any hit position")
+                showNotice("找不到「\(item.displayName)」的渲染位置")
+                return
+            }
+            log("fold-drag \(item.stableID) \(Int(grab))→\(Int(collapsedPoint.x))")
+            await EventPoster.drag(from: CGPoint(x: grab, y: 16.5), to: collapsedPoint)
+            moved = await positionCheck(item) { pos, _ in
+                pos.x < self.collapseBoundary - 1 || self.isParked(pos)
+            }
+        }
+        log("fold \(item.stableID) moved=\(moved)")
+        if moved { foldedIDs.insert(item.stableID) }
+        else { showNotice("未能折叠「\(item.displayName)」") }
         refresh()
     }
+
+    /// Best-effort unfold: AX-set position, then a coordinate drag out of
+    /// the overflow zone. Stacked items usually can't be hit-tested — when
+    /// that fails we tell the user to use the system's ⌄ tray.
+    func unfold(_ item: MenuBarItem) async {
+        let target = CGPoint(x: collapseBoundary + 60, y: 4.5)
+
+        // Attempt 1: AX-set the position attribute — verified working on
+        // macOS 27 even for items stacked in the overflow zone.
+        if let el = item.axElement {
+            Self.setAXPosition(el, to: target)
+        }
+        var moved = await positionCheck(item) { pos, _ in
+            pos.x >= self.collapseBoundary - 1 && !self.isParked(pos)
+        }
+
+        // Attempt 2: coordinate ⌘-drag out of the overflow zone (items in
+        // the zone usually aren't hit-testable, so this rarely lands).
+        if !moved {
+            await EventPoster.drag(
+                from: CGPoint(x: item.frame.midX, y: item.frame.midY),
+                to: target
+            )
+            moved = await positionCheck(item) { pos, _ in
+                pos.x >= self.collapseBoundary - 1 && !self.isParked(pos)
+            }
+        }
+        log("unfold \(item.stableID) moved=\(moved)")
+        if moved {
+            foldedIDs.remove(item.stableID)
+        } else {
+            showNotice("无法自动展开「\(item.displayName)」— 请点击菜单栏 ⌄ 手动拖出")
+        }
+        refresh()
+    }
+
+    /// Re-applies persisted folds on launch: items the user folded that the
+    /// system currently renders get dragged back into the overflow zone.
+    private func restoreFolds() async {
+        guard !hasRestoredFolds else { return }
+        hasRestoredFolds = true
+        for item in visibleItems where foldedIDs.contains(item.stableID) && item.isMovable {
+            await fold(item)
+        }
+    }
+
+    // MARK: - Use an item
+
+    /// Activates an item via AXPress. On macOS 27 this works even for items
+    /// in the system overflow zone — the app still opens its menu.
+    func use(_ row: MenuBarItem) async {
+        // Re-resolve the row against the current lists — stale rows may
+        // carry dead AX elements after a move.
+        let current = collapsedItems + visibleItems + parkedItems
+        let item = current.first(where: { $0.stableID == row.stableID }) ?? row
+        log("use \(item.stableID)")
+
+        // Prefer a freshly fetched element for the owning app — the stored
+        // element goes stale when the system rebuilds its extras.
+        if let bundleID = item.appBundleID {
+            let key = Self.key(of: item)
+            if let live = await Self.findExtra(bundleID: bundleID, matching: key) {
+                AXUIElementPerformAction(live.element, kAXPressAction as CFString)
+                return
+            }
+        }
+        if let element = item.axElement {
+            AXUIElementPerformAction(element, kAXPressAction as CFString)
+        }
+    }
+
+    // MARK: - AX enumeration
 
     /// Blocking AX enumeration over all running apps — call off the main thread.
     private nonisolated static func enumerateAXExtras() -> [AXExtraInfo] {
         var result = [AXExtraInfo]()
+        for app in NSWorkspace.shared.runningApplications {
+            guard app.bundleIdentifier != nil else { continue }
+            result.append(contentsOf: extrasForApp(app))
+        }
+        // Disambiguate identical extras from the same app.
+        var seen = [String: Int]()
+        for i in result.indices {
+            let key = "\(result[i].appBundleID ?? "")|\(result[i].title ?? "")|\(result[i].identifier ?? "")"
+            let n = seen[key, default: 0]
+            result[i].occurrence = n
+            seen[key] = n + 1
+        }
+        return result
+    }
+
+    /// Extras of one app — used for full passes and for per-item re-checks.
+    private nonisolated static func extrasForApp(_ app: NSRunningApplication) -> [AXExtraInfo] {
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, 0.5)
+        var extrasBar: AnyObject?
+        guard
+            AXUIElementCopyAttributeValue(appElement, "AXExtrasMenuBar" as CFString, &extrasBar) == .success,
+            let extrasBar
+        else { return [] }
+        var children: AnyObject?
+        guard
+            AXUIElementCopyAttributeValue(
+                extrasBar as! AXUIElement, kAXChildrenAttribute as CFString, &children
+            ) == .success
+        else { return [] }
+
         let attrs = [
             kAXPositionAttribute, kAXSizeAttribute,
             kAXTitleAttribute, kAXDescriptionAttribute, kAXIdentifierAttribute,
+            kAXRoleAttribute,
         ] as CFArray
+        var out = [AXExtraInfo]()
+        for child in children as? [AXUIElement] ?? [] {
+            var values: CFArray?
+            AXUIElementCopyMultipleAttributeValues(child, attrs, [], &values)
+            let vals = values as? [Any] ?? []
+            var position = CGPoint.zero
+            var size = CGSize.zero
+            if let v = axValue(vals, at: 0) { AXValueGetValue(v, .cgPoint, &position) }
+            if let v = axValue(vals, at: 1) { AXValueGetValue(v, .cgSize, &size) }
+            out.append(AXExtraInfo(
+                element: child,
+                position: position,
+                size: size,
+                title: vals[safe: 2] as? String,
+                description: vals[safe: 3] as? String,
+                identifier: vals[safe: 4] as? String,
+                role: vals[safe: 5] as? String,
+                appPID: app.processIdentifier,
+                appName: app.localizedName,
+                appBundleID: app.bundleIdentifier,
+                appIcon: app.icon
+            ))
+        }
+        return out
+    }
 
-        for app in NSWorkspace.shared.runningApplications {
-            guard let bundleID = app.bundleIdentifier else { continue }
-            let appElement = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(appElement, 0.5)
+    /// Identity key used to find the same logical extra in a fresh pass.
+    private nonisolated static func key(of item: MenuBarItem) -> String {
+        "\(item.axTitle ?? "")|\(item.axIdentifier ?? "")|\(item.occurrence)"
+    }
 
-            var extrasBar: AnyObject?
-            guard
-                AXUIElementCopyAttributeValue(appElement, "AXExtrasMenuBar" as CFString, &extrasBar) == .success,
-                let extrasBar
-            else {
-                continue
+    /// Re-reads one app's extras and returns the element whose identity key
+    /// matches the item (occurrence counted per that app's extras order).
+    private nonisolated static func findExtra(
+        bundleID: String, matching key: String
+    ) async -> AXExtraInfo? {
+        await Task.detached {
+            guard let app = NSWorkspace.shared.runningApplications
+                .first(where: { $0.bundleIdentifier == bundleID })
+            else { return nil }
+            var seen = [String: Int]()
+            for extra in extrasForApp(app) {
+                let identity = "\(extra.title ?? "")|\(extra.identifier ?? "")"
+                let occurrence = seen[identity, default: 0]
+                seen[identity] = occurrence + 1
+                if "\(identity)|\(occurrence)" == key { return extra }
             }
-            var children: AnyObject?
-            guard
-                AXUIElementCopyAttributeValue(
-                    extrasBar as! AXUIElement, kAXChildrenAttribute as CFString, &children
-                ) == .success
-            else {
-                continue
+            return nil
+        }.value
+    }
+
+    /// Finds where an item is actually rendered by sweeping
+    /// AXUIElementCopyElementAtPosition across the visible bar region and
+    /// matching the owning process. AX positions are logical and can drift
+    /// tens of pixels after the system rebalances — hit-testing is ground
+    /// truth. Runs off the main thread.
+    private func renderedCenterX(of item: MenuBarItem) async -> CGFloat? {
+        guard let pid = item.appPID else { return nil }
+        let boundary = collapseBoundary
+        let approx = item.frame
+        let screenMax = NSScreen.main?.frame.maxX ?? 1512
+        return await Task.detached {
+            let sys = AXUIElementCreateSystemWide()
+            func hitMatches(_ x: CGFloat) -> Bool {
+                var el: AXUIElement?
+                guard AXUIElementCopyElementAtPosition(sys, Float(x), 16, &el) == .success,
+                      let hit = el
+                else { return false }
+                var hitPID: pid_t = 0
+                AXUIElementGetPid(hit, &hitPID)
+                return hitPID == pid
             }
-            let kids = children as? [AXUIElement] ?? []
-            guard !kids.isEmpty else { continue }
-            for child in kids {
-                var values: CFArray?
-                AXUIElementCopyMultipleAttributeValues(child, attrs, [], &values)
-                let vals = values as? [Any] ?? []
-                var position = CGPoint.zero
-                var size = CGSize.zero
-                if let v = axValue(vals, at: 0) { AXValueGetValue(v, .cgPoint, &position) }
-                if let v = axValue(vals, at: 1) { AXValueGetValue(v, .cgSize, &size) }
-                // Empty stubs (size 0 at a sentinel position) carry no info.
-                if size == .zero { continue }
-                var wid: CGWindowID = 0
-                let windowID: CGWindowID? =
-                    _AXUIElementGetWindow(child, &wid) == .success && wid != 0 ? wid : nil
-                result.append(AXExtraInfo(
-                    element: child,
-                    windowID: windowID,
-                    position: position,
-                    size: size,
-                    title: vals[safe: 2] as? String,
-                    description: vals[safe: 3] as? String,
-                    identifier: vals[safe: 4] as? String,
-                    appPID: app.processIdentifier,
-                    appName: app.localizedName,
-                    appBundleID: bundleID,
-                    appIcon: app.icon
-                ))
+            // Cheap pass first: the item's logical span ± its width.
+            var xs = [CGFloat]()
+            let lo = max(boundary + 2, approx.minX - approx.width)
+            let hi = approx.maxX + approx.width
+            var x = lo
+            while x <= hi { xs.append(x); x += 4 }
+            // Fallback: the whole visible region.
+            var wx = boundary + 2
+            while wx <= screenMax { xs.append(wx); wx += 4 }
+            var hits = [CGFloat]()
+            for px in xs where hitMatches(px) { hits.append(px) }
+            guard !hits.isEmpty else { return nil }
+            // An app may publish several extras — cluster contiguous hits
+            // (>8px gap splits) and take the cluster nearest the AX position.
+            var clusters = [[CGFloat]]()
+            for h in hits {
+                if var last = clusters.last, h - last.last! <= 8 {
+                    last.append(h); clusters[clusters.count - 1] = last
+                } else {
+                    clusters.append([h])
+                }
+            }
+            let best = clusters.min(by: {
+                abs(($0.first! + $0.last!) / 2 - approx.midX)
+                    < abs(($1.first! + $1.last!) / 2 - approx.midX)
+            })!
+            return (best.first! + best.last!) / 2
+        }.value
+    }
+
+    /// Re-reads the owning app's extras and polls the item's position
+    /// against a predicate — the system's AX position update lags a move
+    /// by up to ~1s, so we poll briefly before giving up.
+    private func positionCheck(
+        _ item: MenuBarItem,
+        where predicate: (CGPoint, CGSize) -> Bool
+    ) async -> Bool {
+        guard let bundleID = item.appBundleID else { return false }
+        let key = Self.key(of: item)
+        for attempt in 0...7 {
+            if attempt > 0 {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            if let live = await Self.findExtra(bundleID: bundleID, matching: key),
+               predicate(live.position, live.size) {
+                return true
             }
         }
-        return result
+        return false
+    }
+
+    /// Writes AXPosition on an extra. On macOS 27 the setter returns an
+    /// error yet still applies — so we ignore the code and verify by
+    /// polling the position afterwards.
+    private nonisolated static func setAXPosition(_ element: AXUIElement, to point: CGPoint) {
+        var p = point
+        if let v = AXValueCreate(.cgPoint, &p) {
+            AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, v)
+        }
+    }
+
+    private func isParked(_ p: CGPoint) -> Bool {
+        p.x < 0 || p.y < 0 || p.y > 45
+    }
+
+    private func showNotice(_ message: String) {
+        notice = message
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            self?.notice = nil
+        }
     }
 
     private nonisolated static func axValue(_ vals: [Any], at index: Int) -> AXValue? {
@@ -440,313 +550,6 @@ final class MenuBarItemManager: ObservableObject {
         let v = vals[index] as CFTypeRef
         guard CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
         return (v as! AXValue)
-    }
-
-    // MARK: - Divider placement
-
-    /// Moves the divider to the left edge so nothing is folded initially.
-    private func placeDividerIfNeeded() async {
-        guard !hasPlacedDivider, let dividerWID = appState?.controlItems.dividerWindowID else {
-            return
-        }
-        guard let leftmost = otherItems.min(by: { $0.frame.minX < $1.frame.minX }),
-              let leftFrame = Bridging.frame(of: leftmost.windowID ?? 0)
-        else {
-            return
-        }
-        guard let dividerFrame = Bridging.frame(of: dividerWID),
-              dividerFrame.minX > leftFrame.minX
-        else {
-            hasPlacedDivider = true
-            return
-        }
-        _ = await EventPoster.move(
-            item: ownItemAsMenuBarItem(dividerWID),
-            to: .leftOf(windowID: leftmost.windowID ?? 0, point: CGPoint(x: leftFrame.minX, y: leftFrame.midY))
-        )
-        hasPlacedDivider = true
-    }
-
-    /// Moves our chevron into the visible part of the menu bar (right of the
-    /// notch / app-menu boundary), if it isn't already.
-    private func placeChevronIfNeeded() async {
-        guard let chevronWID = appState?.controlItems.chevronWindowID,
-              let chevronFrame = Bridging.frame(of: chevronWID)
-        else {
-            return
-        }
-        let boundary = rightContentBoundary()
-        if chevronFrame.minX > boundary, chevronFrame.maxX <= (NSScreen.main?.frame.maxX ?? .infinity) {
-            return
-        }
-        let width = max(chevronFrame.width, 24)
-        let candidates = otherItems
-            .filter { $0.isOnScreen && $0.windowID != nil }
-            .sorted { $0.frame.minX < $1.frame.minX }
-        guard
-            let target = candidates.first(where: { $0.frame.minX - width > boundary + 4 })
-                ?? candidates.first,
-            let targetWID = target.windowID,
-            let targetFrame = Bridging.frame(of: targetWID)
-        else {
-            return
-        }
-        _ = await EventPoster.move(
-            item: ownItemAsMenuBarItem(chevronWID),
-            to: .leftOf(windowID: targetWID, point: CGPoint(x: targetFrame.minX, y: targetFrame.midY))
-        )
-    }
-
-    /// Builds a MenuBarItem-shaped view of one of our own control items.
-    private func ownItemAsMenuBarItem(_ windowID: CGWindowID) -> MenuBarItem {
-        let info = WindowInfo.allByWindowID()[windowID]
-        return MenuBarItem(
-            windowID: windowID,
-            frame: Bridging.frame(of: windowID) ?? .zero,
-            isOnScreen: true,
-            windowTitle: info?.title ?? "",
-            windowOwnerPID: info?.ownerPID ?? 0,
-            appPID: nil, appName: nil, appBundleID: nil, appIcon: nil,
-            axTitle: nil, axDescription: nil, axElement: nil
-        )
-    }
-
-    // MARK: - Fold / unfold
-
-    func fold(_ item: MenuBarItem) async {
-        guard let dividerWID = appState?.controlItems.dividerWindowID,
-              let dividerFrame = Bridging.frame(of: dividerWID)
-        else { return }
-        log("fold \(item.stableID) to leftOf divider@\(dividerFrame.minX)")
-        let ok = await EventPoster.move(
-            item: item,
-            to: .leftOf(
-                windowID: dividerWID,
-                point: CGPoint(x: dividerFrame.minX, y: dividerFrame.midY)
-            )
-        )
-        log("fold result=\(ok)")
-        if ok {
-            foldedIDs.insert(item.stableID)
-        }
-        refresh()
-    }
-
-    func unfold(_ item: MenuBarItem) async {
-        guard let dividerWID = appState?.controlItems.dividerWindowID,
-              let dividerFrame = Bridging.frame(of: dividerWID)
-        else { return }
-
-        // Drop next to the visible cluster — landing right of the divider
-        // would put the item underneath the app's menus (x ≈ 0-250).
-        let destination = visibleDropDestination() ?? .rightOf(
-            windowID: dividerWID,
-            point: CGPoint(x: dividerFrame.maxX, y: dividerFrame.midY)
-        )
-
-        log("unfold \(item.stableID) to \(destination)")
-        let ok = await EventPoster.move(item: item, to: destination)
-        log("unfold result=\(ok)")
-        if ok {
-            foldedIDs.remove(item.stableID)
-        }
-        refresh()
-    }
-
-    /// Drop destination adjacent to the visible item cluster (the leftmost
-    /// item that is actually rendered outside the app-menu region).
-    private func visibleDropDestination() -> EventPoster.MoveDestination? {
-        let boundary = rightContentBoundary()
-        guard
-            let target = otherItems
-                .filter({ $0.isOnScreen && $0.windowID != nil && $0.frame.minX >= boundary - 4 })
-                .min(by: { $0.frame.minX < $1.frame.minX }),
-            let targetWID = target.windowID,
-            let targetFrame = Bridging.frame(of: targetWID)
-        else {
-            return nil
-        }
-        return .leftOf(
-            windowID: targetWID,
-            point: CGPoint(x: targetFrame.minX, y: targetFrame.midY)
-        )
-    }
-
-    /// Re-applies persisted folds after launch, then normalizes: anything
-    /// physically folded that isn't in the persisted set (items drift left
-    /// when the divider's slot moves between launches) gets unfolded, so the
-    /// folded set always equals exactly what the user chose.
-    private func restoreFolds() async {
-        guard !hasRestoredFolds else { return }
-        hasRestoredFolds = true
-        for item in otherItems where foldedIDs.contains(item.stableID) {
-            await fold(item)
-        }
-        refresh()
-        for item in foldedItems where !foldedIDs.contains(item.stableID) {
-            await unfold(item)
-        }
-
-        // Repair: items rendered on top of the app-menu region (left behind
-        // by earlier versions' bad drop target, or manually dragged there by
-        // the user) get moved back next to the visible cluster.
-        let boundary = rightContentBoundary()
-        for item in otherItems
-        where item.isOnScreen && item.frame.minX < boundary - 20 && item.windowID != nil {
-            if let destination = visibleDropDestination() {
-                log("repair misplaced \(item.stableID)@\(item.frame.minX) → \(destination)")
-                _ = await EventPoster.move(item: item, to: destination)
-            }
-        }
-        refresh()
-    }
-
-    // MARK: - Use an item
-
-    /// Activates an item: clicks it in place if visible, otherwise temporarily
-    /// moves it into the visible area, clicks it, and rehides it later.
-    func use(_ row: MenuBarItem) async {
-        // The row may carry a stale window ID (items get recreated and IDs
-        // reused); re-resolve against the CURRENT lists — by stableID first,
-        // then by the window ID itself. Never click a stale row's window.
-        refresh()
-        let current = foldedItems + otherItems + parkedItems
-        let item = current.first(where: { $0.stableID == row.stableID })
-            ?? current.first(where: { $0.windowID != nil && $0.windowID == row.windowID })
-            ?? row
-        log("use \(item.stableID) wid=\(String(describing: item.windowID)) folded=\(foldedItems.contains { $0.id == item.id }) onscreen=\(item.isOnScreen)")
-        guard let wid = item.windowID, let frame = Bridging.frame(of: wid) else {
-            // Parked item: try a direct AX press — the app may still respond.
-            if let element = item.axElement {
-                AXUIElementPerformAction(element, "AXPress" as CFString)
-            }
-            return
-        }
-
-        let isFolded = foldedItems.contains { $0.id == item.id }
-        if !isFolded, item.isOnScreen {
-            _ = await EventPoster.click(item: item)
-            return
-        }
-
-        // Temporarily show: find a visible item with enough room to its left
-        // to fit our item while staying clear of the notch / app menus.
-        refresh()
-        let boundary = rightContentBoundary()
-        let candidates = otherItems
-            .filter { $0.isOnScreen && $0.windowID != nil }
-            .sorted { $0.frame.minX < $1.frame.minX }
-        let itemWidth = max(frame.width, 20)
-        guard
-            let target = candidates.first(where: { $0.frame.minX - itemWidth > boundary + 4 })
-                ?? candidates.first
-        else {
-            log("use: no room to show \(item.stableID)")
-            return
-        }
-        guard let targetFrame = Bridging.frame(of: target.windowID!) else { return }
-
-        log("tempShow \(item.stableID) leftOf \(target.stableID)@\(targetFrame.minX), boundary=\(boundary)")
-        let shown = await EventPoster.move(
-            item: item,
-            to: .leftOf(
-                windowID: target.windowID!,
-                point: CGPoint(x: targetFrame.minX, y: targetFrame.midY)
-            )
-        )
-        guard shown else { return }
-
-        try? await Task.sleep(for: .milliseconds(60))
-        var fresh = item
-        fresh.frame = Bridging.frame(of: wid) ?? item.frame
-        _ = await EventPoster.click(item: fresh)
-
-        scheduleRehide(itemID: item.id, windowID: wid)
-        refresh()
-    }
-
-    /// Left edge that a temporarily shown item must stay right of
-    /// (notch's right edge, or the end of the foreground app's menus).
-    private func rightContentBoundary() -> CGFloat {
-        if let area = NSScreen.main?.auxiliaryTopRightArea {
-            return area.minX + 8
-        }
-        return appMenuBarMaxX() + 8
-    }
-
-    /// maxX of the frontmost app's application menus (for non-notch displays).
-    private func appMenuBarMaxX() -> CGFloat {
-        guard let front = NSWorkspace.shared.frontmostApplication else { return 0 }
-        let appElement = AXUIElementCreateApplication(front.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, 0.5)
-        var menuBar: AnyObject?
-        guard
-            AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &menuBar) == .success,
-            let menuBar
-        else {
-            return 0
-        }
-        var children: AnyObject?
-        guard
-            AXUIElementCopyAttributeValue(
-                menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &children
-            ) == .success
-        else {
-            return 0
-        }
-        var maxX: CGFloat = 0
-        for child in children as? [AXUIElement] ?? [] {
-            var posRef: AnyObject?
-            var sizeRef: AnyObject?
-            AXUIElementCopyAttributeValue(child, kAXPositionAttribute as CFString, &posRef)
-            AXUIElementCopyAttributeValue(child, kAXSizeAttribute as CFString, &sizeRef)
-            var p = CGPoint.zero
-            var s = CGSize.zero
-            if let posRef { AXValueGetValue(posRef as! AXValue, .cgPoint, &p) }
-            if let sizeRef { AXValueGetValue(sizeRef as! AXValue, .cgSize, &s) }
-            maxX = max(maxX, p.x + s.width)
-        }
-        return maxX
-    }
-
-    private func scheduleRehide(itemID: String, windowID: CGWindowID) {
-        tempShown[itemID]?.task.cancel()
-        let interval = SettingsStore.shared.tempShowInterval
-        let task = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(interval))
-            guard !Task.isCancelled, let self else { return }
-            await self.rehide(windowID: windowID, itemID: itemID)
-        }
-        tempShown[itemID] = TempShownContext(itemID: itemID, windowID: windowID, task: task)
-    }
-
-    /// Moves a temporarily shown item back into the folded area.
-    private func rehide(windowID: CGWindowID, itemID: String) async {
-        defer { tempShown.removeValue(forKey: itemID) }
-        guard let dividerWID = appState?.controlItems.dividerWindowID,
-              let dividerFrame = Bridging.frame(of: dividerWID),
-              let itemFrame = Bridging.frame(of: windowID)
-        else {
-            return
-        }
-        let infos = WindowInfo.allByWindowID()[windowID]
-        let item = MenuBarItem(
-            windowID: windowID,
-            frame: itemFrame,
-            isOnScreen: true,
-            windowTitle: infos?.title ?? "",
-            windowOwnerPID: infos?.ownerPID ?? 0,
-            appPID: nil, appName: nil, appBundleID: nil, appIcon: nil,
-            axTitle: nil, axDescription: nil, axElement: nil
-        )
-        _ = await EventPoster.move(
-            item: item,
-            to: .leftOf(
-                windowID: dividerWID,
-                point: CGPoint(x: dividerFrame.minX, y: dividerFrame.midY)
-            )
-        )
-        refresh()
     }
 }
 

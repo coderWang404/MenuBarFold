@@ -2,15 +2,13 @@
 
 macOS 菜单栏（顶栏）折叠管理工具 —— 在刘海屏 MacBook 上把塞不下的菜单栏图标收进下拉面板。
 
-类似 Bartender / Hidden Bar / Ice 的核心能力，Swift + AppKit 实现，无依赖。
-
 ## 功能
 
-- 菜单栏放一个 chevron 图标，点击弹出下拉面板
+- 下拉面板列出所有菜单栏项，按 **已折叠 / 顶栏项 / 已移除** 分区，带真实 App 图标与名称
 - 逐项折叠 / 展开菜单栏图标
-- 点击已折叠项：临时移回菜单栏 → 模拟点击弹出它的菜单 → 15 秒后自动收回
+- 点击任意项（包括已折叠、已移除）通过 `AXPress` 直接触发它的菜单——无需移动图标
 - 折叠状态持久化（重启 App 自动恢复）
-- 被系统移除的项单独标注，可尝试 AXPress 兜底激活
+- 全局快捷键 **⌃⌥M** 开关面板
 
 ## 构建与运行
 
@@ -23,27 +21,25 @@ open build/MenuBarFold.app     # 运行（无 Dock 图标）
 
 需要**辅助功能权限**——系统会弹窗引导授权。ad-hoc 签名每次重编译 cdhash 会变，可能需要重新勾选权限。
 
-## 工作原理
+## 工作原理（macOS 27）
 
-macOS 没有公开 API 隐藏菜单栏项。本工具采用与开源项目 Ice 相同的机制（代码自写）：
+macOS 27 中 `MenuBarAgent` 进程接管了所有菜单栏项的合成与折叠（系统自带 ⌄ 按钮）。
+私有窗口枚举 API 已失效，本工具改为纯 Accessibility 实现：
 
-- **枚举**：私有 `CGSGetProcessMenuBarWindowList` 拿到所有菜单栏项窗口。
-  macOS 26 上 extras 窗口统一由 ControlCenter 托管，真实归属通过对每个 App 的
-  `AXExtrasMenuBar` 做位置匹配解析。
-- **隐藏**：一个不可见的分隔符 `NSStatusItem` 展开到屏幕宽度，把它左侧的项全部
-  挤出屏幕（窗口存活，只是画不到）。折叠区 = `item.frame.maxX <= divider.frame.minX`。
-- **移动**：合成 ⌘-drag `CGEvent`，通过私有事件字段指定目标窗口
-  （`mouseEventWindowUnderMousePointer`、windowID 字段 `0x33`、目标进程 PID），
-  因此鼠标坐标可以在屏幕外——被隐藏的项也能拖动。
-- **性能**：枚举分两层——几何层（CGS，~20ms，主线程高频跑）+ 身份层（逐 App AX IPC，
-  后台线程低频跑，按 windowID 缓存 + 锚点约束对齐配对）。
+- **枚举**：逐 App `AXExtrasMenuBar` —— 每个项自带真实归属（App 名称/图标），
+  不存在"点 A 开 B"的身份猜测问题。后台线程枚举，主线程不阻塞。
+- **分类**：以系统 ⌄ 按钮位置为界——右侧=可见，左侧=已折叠，哨兵坐标=已移除。
+- **使用**：`AXPress` 对任何状态的项都有效（系统级能力，实测折叠/移除项也能弹菜单）。
+- **折叠/展开**：直接 `AXUIElementSetAttributeValue(AXPosition)` 写位置
+  （macOS 27 的怪癖：返回错误码但位置真实生效）；折叠有坐标 ⌘-drag 兜底。
+- **入口**：macOS 27 下新建 status item 一律被系统收纳，所以面板主要用
+  **⌃⌥M** 呼出；菜单栏里的 chevron（若出现在系统 ⌄ 托盘）点击也可。
 
 ## 已知限制
 
-- 使用私有 API（CGS/合成事件定向字段），系统升级有失效风险。已在 macOS 26 (arm64) 实测。
-- `_AXUIElementGetWindow` 在 macOS 26 失效，项→App 的身份匹配是位置启发式。
+- 展开折叠项依赖 AX 写位置；系统的 ⌄ 托盘本身无法程序化展开（只能用户手动点）。
 - 多屏 / 多 Space 未处理。
-- 项的"已移除"状态（无窗口）需要重启对应 App 才能恢复。
+- macOS ≤26 使用完全不同的窗口机制，本版本面向 macOS 27。
 
 ## License
 
