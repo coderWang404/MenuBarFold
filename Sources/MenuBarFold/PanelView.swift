@@ -102,6 +102,19 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 4) {
+            if manager.ownChevronParked {
+                HStack(spacing: 6) {
+                    Text("图标被系统收纳")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("重试修复") { manager.retryChevronRecovery() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                    Button("菜单栏设置") { manager.openMenuBarSettings() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                }
+            }
             if let notice = manager.notice {
                 Text(notice)
                     .font(.caption)

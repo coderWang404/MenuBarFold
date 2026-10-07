@@ -49,7 +49,9 @@ final class ControlItems {
     private func makeChevron() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.autosaveName = "MenuBarFold.chevron"
-        item.behavior = [.removalAllowed, .terminationOnRemoval]
+        // No behavior flags: `.terminationOnRemoval` makes macOS 27 destroy
+        // the item outright when the system auto-parks it — then nothing
+        // (Settings toggle, agent restart) can bring it back.
         item.isVisible = true
         if let button = item.button {
             button.image = NSImage(

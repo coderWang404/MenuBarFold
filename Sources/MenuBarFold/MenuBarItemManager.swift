@@ -62,6 +62,10 @@ final class MenuBarItemManager: ObservableObject {
     /// Transient footer message (e.g. when an unfold can't be automated).
     @Published private(set) var notice: String?
 
+    /// Whether our own chevron is parked at the system's sentinel
+    /// position (not rendered anywhere in the bar).
+    @Published private(set) var ownChevronParked: Bool = false
+
     weak var appState: AppState?
 
     /// Left edge of the system collapse ⌄ button — items left of it are
@@ -249,6 +253,25 @@ final class MenuBarItemManager: ObservableObject {
         visibleItems = visible
         parkedItems = parked
         appState?.controlItems.observeOwnExtras(positions: ownPositions)
+
+        ownChevronParked = !ownPositions.isEmpty && ownPositions.allSatisfy { isParked($0) }
+    }
+
+    /// Re-runs the chevron recovery on demand (footer button). Deliberately
+    /// NOT automatic on launch: restarting the system agents re-randomizes
+    /// the whole bar layout and has been observed knocking *other* apps'
+    /// live items into the parked sentinel — too destructive to fire
+    /// unattended.
+    func retryChevronRecovery() {
+        Task { await recoverChevron() }
+    }
+
+    /// Opens System Settings → 菜单栏 (the pane hosting the "允许在菜单栏
+    /// 显示" list) so the user can inspect the app's allow switch.
+    func openMenuBarSettings() {
+        NSWorkspace.shared.open(
+            URL(string: "x-apple.systempreferences:com.apple.ControlCenter-Settings.extension")!
+        )
     }
 
     // MARK: - Fold / unfold
@@ -330,6 +353,59 @@ final class MenuBarItemManager: ObservableObject {
         for item in visibleItems where foldedIDs.contains(item.stableID) && item.isMovable {
             await fold(item)
         }
+    }
+
+    /// Recovers a chevron the system parked at the sentinel position.
+    ///
+    /// On macOS 27 every freshly created NSStatusItem is parked offscreen;
+    /// neither `isVisible`, position writes, nor recreation bring it back.
+    /// The only observed recovery is restarting the agents that own the
+    /// menu-bar layout — ControlCenter first, then MenuBarAgent (launchd
+    /// respawns both; the bar flickers once). After the re-layout our item
+    /// lands in the collapse cluster as a normal live item, so we AX-write
+    /// it into the visible strip.
+    private func recoverChevron() async {
+        log("chevron parked — restarting ControlCenter/MenuBarAgent")
+        await Task.detached { Self.restartMenuBarAgents() }.value
+        try? await Task.sleep(for: .seconds(2))
+        if let own = await Self.ownExtra(), !own.isParkedPosition,
+           let leftmost = visibleItems.min(by: { $0.frame.minX < $1.frame.minX }) {
+            Self.setAXPosition(
+                own.element, to: CGPoint(x: leftmost.frame.minX - 30, y: 4.5)
+            )
+        }
+        refresh()
+        // Wait for the relayout to settle, then report the outcome.
+        try? await Task.sleep(for: .seconds(4))
+        if let own = await Self.ownExtra() {
+            log("chevron recovery: item now at \(own.position)")
+            if own.isParkedPosition {
+                showNotice("图标仍未恢复 — 试试重启 Mac，或在 系统设置›菜单栏 中检查")
+            }
+        }
+    }
+
+    /// Kills the agents that own menu-bar layout; launchd respawns them.
+    private nonisolated static func restartMenuBarAgents() {
+        for name in ["ControlCenter", "MenuBarAgent"] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+            p.arguments = [name]
+            try? p.run()
+            p.waitUntilExit()
+            Thread.sleep(forTimeInterval: 0.8)
+        }
+    }
+
+    /// Reads our own app's extras (the chevron).
+    private nonisolated static func ownExtra() async -> AXExtraInfo? {
+        await Task.detached {
+            guard let bid = Bundle.main.bundleIdentifier,
+                  let app = NSRunningApplication
+                      .runningApplications(withBundleIdentifier: bid).first
+            else { return nil }
+            return extrasForApp(app).first
+        }.value
     }
 
     // MARK: - Use an item

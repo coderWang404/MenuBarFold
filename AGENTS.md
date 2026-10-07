@@ -47,9 +47,21 @@ open build/MenuBarFold.app        # 运行（无 Dock 图标，LSUIElement）
   可靠路径。
 - **验证 = 轮询**：移动后 AX 位置更新有延迟，positionCheck 按 250ms×8 轮询。
 - **自己的 chevron**：macOS 27 下**新建 NSStatusItem 一律进哨兵位**（写
-  autosaveName + Preferred Position 偏好也没用）。所以面板入口是
-  **全局快捷键 ⌃⌥M**（`addGlobalMonitorForEvents`）+ 哨兵位 chevron 仍响应
-  AXPress（用户若能在系统 ⌄ 托盘里找到它，点击也能开）。
+  autosaveName + Preferred Position 偏好、isVisible 开关、换 bundleID、
+  带 menu/纯文本变体、in-process 重建——全部无效）。这是系统级行为：
+  同病症见 Stats #3120 / CodexBar #3377 / oMLX #1497 —— 系统设置›菜单栏›
+  「允许在菜单栏显示」里的开关只控制 isAllowed，**不强制重新放置**。
+  - `x-apple.systempreferences:com.apple.ControlCenter-Settings.extension`
+    直达该面板（开关可在 AX 树里找到：名字是静态文本，checkbox 同 y 坐标
+    配对）。
+  - **实测唯一生效过的恢复：`killall ControlCenter && killall MenuBarAgent`**
+    （launchd 自动拉起，菜单栏闪一下）——成功率约 1/5，且重启 agents 会
+    重排整个菜单栏布局，**可能把别的 App 的活项打进哨兵位**（观测到
+    CC Switch/Qoder CN 被误伤）。所以只有面板里『重试修复』手动触发，
+    不做启动自动恢复。最可靠的恢复是重启 Mac（启动时系统重算布局）。
+  - 面板入口 = **⌃⌥M** + 哨兵位 chevron 仍响应 AXPress。
+  - ⚠️ 别给 chevron 设 `.terminationOnRemoval`：系统收纳时会直接销毁项，
+    之后任何手段都救不回来（已去掉）。
 - **持久化**：foldedIDs = `bundleID|axTitle|axIdentifier|#occurrence`，
   启动后对仍可见的持久化项重放折叠。
 
@@ -75,7 +87,7 @@ Sources/MenuBarFold/
   MenuBarItem.swift        项模型 + placement 分类 + stableID
   MenuBarItemManager.swift AX 枚举/分类/折叠/展开/AXPress/持久化 + 调试钩子
   EventPoster.swift        坐标 ⌘-drag（折叠兜底）
-  ControlItems.swift       chevron NSStatusItem（哨兵位感知）
+  ControlItems.swift       chevron NSStatusItem（哨兵位感知，无 behavior flags）
   PanelController.swift    NSPanel 锚定（AX 位置优先，右侧兜底）
   PanelView.swift          SwiftUI 下拉列表（三区：已折叠/顶栏项/已移除）
   SettingsStore.swift      UserDefaults
